@@ -1,0 +1,190 @@
+import Foundation
+import XCTest
+
+final class FlowUITests: XCTestCase {
+    enum Language: String, CaseIterable {
+        case simplified = "zh-Hans", english = "en", traditional = "zh-Hant"
+        var locale: String {
+            switch self {
+            case .simplified: "zh_CN"
+            case .english: "en_US"
+            case .traditional: "zh_TW"
+            }
+        }
+        var demoPlant: String {
+            switch self {
+            case .simplified: "龟背竹"
+            case .english: "Monstera"
+            case .traditional: "龜背芋"
+            }
+        }
+    }
+
+    private let app = XCUIApplication()
+    private let validImport = """
+    {
+      "version": 1,
+      "name": "Fern",
+      "interval": 9
+    }
+    """
+
+    override func setUpWithError() throws { continueAfterFailure = false }
+
+    private func launch(_ args: [String] = [], language: Language = .simplified, reset: Bool = true, file: String? = nil) {
+        app.launchArguments = ["-ui-testing", "-AppleLanguages", "(\(language.rawValue))", "-AppleLocale", language.locale]
+            + (reset ? ["-reset"] : []) + args
+        app.launchEnvironment = file.map { ["PLANTCARE_TEST_IMPORT": $0] } ?? [:]
+        app.launch()
+    }
+
+    private func button(_ id: String) -> XCUIElement { app.buttons[id].firstMatch }
+
+    private func prefixed(_ prefix: String) -> XCUIElement {
+        app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix)).firstMatch
+    }
+
+    private func node(_ id: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: id).firstMatch
+    }
+
+    private func tap(_ target: XCUIElement) {
+        XCTAssertTrue(target.waitForExistence(timeout: 8), target.debugDescription)
+        target.tap()
+    }
+
+    private func shot(_ name: String) {
+        let screenshot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        if let path = ProcessInfo.processInfo.environment["SHOTS_DIR"] ?? ProcessInfo.processInfo.environment["TEST_RUNNER_SHOTS_DIR"] {
+            let directory = URL(fileURLWithPath: path, isDirectory: true)
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? screenshot.pngRepresentation.write(to: directory.appendingPathComponent(name + ".png"), options: .atomic)
+        }
+    }
+
+    func testFirstPlantAndPersistence() {
+        launch()
+        tap(button("add-empty"))
+        let field = app.textFields["plant-name"]
+        tap(field)
+        field.typeText("Fern")
+        tap(button("save-plant"))
+        let plant = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "plant-", "Fern")).firstMatch
+        XCTAssertTrue(plant.waitForExistence(timeout: 8))
+        app.terminate()
+        launch(reset: false)
+        tap(plant)
+        XCTAssertTrue(node("timeline-title").waitForExistence(timeout: 8))
+        XCTAssertFalse(button("share-comparison").exists)
+    }
+
+    func testWaterUndoBackfillAndPostpone() {
+        launch(["-fixtures"])
+        tap(prefixed("water-"))
+        tap(button("undo-water"))
+        tap(prefixed("log-"))
+        tap(button("save-log"))
+        tap(prefixed("plant-"))
+        XCTAssertTrue(node("event-water").waitForExistence(timeout: 8))
+        app.terminate()
+        launch(["-fixtures"])
+        tap(prefixed("postpone-"))
+        XCTAssertTrue(app.staticTexts["明天再查盆土"].waitForExistence(timeout: 8))
+        XCTAssertFalse(button("undo-water").exists)
+    }
+
+    func testReminderAndPhotosPickerCancellation() {
+        launch(["-fixtures"], language: .english)
+        tap(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "plant-", "Pothos")).firstMatch)
+        tap(button("edit-reminder"))
+        tap(button("disable-reminder"))
+        XCTAssertTrue(app.staticTexts["Reminder off"].waitForExistence(timeout: 8))
+        tap(button("edit-reminder"))
+        tap(button("save-reminder"))
+        tap(prefixed("photo-"))
+        tap(app.buttons["Cancel"].firstMatch)
+        XCTAssertTrue(node("timeline-title").waitForExistence(timeout: 8))
+        XCTAssertFalse(node("event-photo").exists)
+    }
+
+    func testImportFilePreviewAndExpiredPreservesFivePlants() {
+        launch(["-fixtures", "-five", "-expired"], file: validImport)
+        XCTAssertTrue(node("import-name").waitForExistence(timeout: 8))
+        tap(button("confirm-import"))
+        XCTAssertTrue(node("paywall-heading").waitForExistence(timeout: 8))
+        tap(button("close-panel"))
+        tap(prefixed("water-"))
+        XCTAssertTrue(button("undo-water").waitForExistence(timeout: 8))
+        tap(prefixed("plant-"))
+        tap(button("share-comparison"))
+        XCTAssertTrue(node("paywall-heading").waitForExistence(timeout: 8))
+    }
+
+    func testCodeImportAndRestore() throws {
+        launch(["-fixtures", "-expired", "-restore-pro"])
+        tap(button("home-more"))
+        tap(button("import-care"))
+        let editor = node("care-code")
+        tap(editor)
+        editor.typeText("PLANTCARE1:" + Data(validImport.utf8).base64EncodedString())
+        tap(button("preview-code"))
+        tap(button("confirm-import"))
+        XCTAssertTrue(node("paywall-heading").waitForExistence(timeout: 8))
+        tap(button("restore-purchases"))
+        XCTAssertTrue(node("pro-owned").waitForExistence(timeout: 8))
+        tap(button("close-panel"))
+        tap(button("add-plant"))
+        XCTAssertTrue(app.textFields["plant-name"].waitForExistence(timeout: 8))
+    }
+
+    func testInvalidFileRejected() {
+        launch(file: "{\"version\":2,\"name\":\"Fern\"}")
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 8))
+        XCTAssertFalse(button("confirm-import").exists)
+        // 系统 alert 里按钮的 accessibilityIdentifier 带不过去（11-19 云端），直接点弹窗里的按钮
+        tap(app.alerts.firstMatch.buttons.firstMatch)
+        XCTAssertTrue(button("add-empty").exists)
+    }
+
+    func testValidFileAddsSeparatePlantWithRemindersOff() {
+        launch(language: .english, file: validImport)
+        XCTAssertTrue(node("import-name").waitForExistence(timeout: 8))
+        tap(button("confirm-import"))
+        tap(prefixed("plant-"))
+        XCTAssertTrue(app.staticTexts["Reminder off"].waitForExistence(timeout: 8))
+    }
+
+    func testStoreSimplified() { store(.simplified) }
+    func testStoreEnglish() { store(.english) }
+    func testStoreTraditional() { store(.traditional) }
+
+    private func store(_ language: Language) {
+        launch(["-fixtures", "-store-shots"], language: language)
+        XCTAssertTrue(node("due-count").waitForExistence(timeout: 8))
+        shot("store-\(language.rawValue)-01-home")
+        tap(prefixed("water-"))
+        XCTAssertTrue(button("undo-water").waitForExistence(timeout: 8))
+        shot("store-\(language.rawValue)-02-water")
+        tap(button("undo-water"))
+        tap(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "plant-", language.demoPlant)).firstMatch)
+        XCTAssertTrue(node("event-photo").waitForExistence(timeout: 8))
+        shot("store-\(language.rawValue)-03-timeline")
+        tap(button("share-comparison"))
+        XCTAssertTrue(node("comparison-card").waitForExistence(timeout: 8))
+        shot("store-\(language.rawValue)-04-comparison")
+        tap(button("close-panel"))
+        tap(button("gift-care"))
+        XCTAssertTrue(button("share-gift").waitForExistence(timeout: 8))
+        shot("store-\(language.rawValue)-05-gift")
+    }
+
+    func testPaidScreenshot() {
+        launch(["-paywall", "-expired"])
+        XCTAssertTrue(node("paywall-heading").waitForExistence(timeout: 8))
+        shot("paid-01-paywall")
+    }
+}
